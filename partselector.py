@@ -6,6 +6,7 @@ import time
 import wx  # pylint: disable=import-error
 import wx.dataview  # pylint: disable=import-error
 
+from .derive_params import params_for_part  # pylint: disable=import-error
 from .events import AssignPartsEvent, UpdateSetting
 from .helpers import HighResWxSize, loadBitmapScaled
 from .partdetails import PartDetailsDialog
@@ -30,6 +31,9 @@ class PartSelectorDialog(wx.Dialog):
         self.parts = parts
         lcsc_selection = self.get_existing_selection(parts)
 
+        self.search_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.search)
+
         # ---------------------------------------------------------------------
         # ---------------------------- Hotkeys --------------------------------
         # ---------------------------------------------------------------------
@@ -50,18 +54,39 @@ class PartSelectorDialog(wx.Dialog):
         keyword_label = wx.StaticText(
             self,
             wx.ID_ANY,
-            "Keyword",
+            "Keywords",
             size=HighResWxSize(parent.window, wx.Size(150, 15)),
+            style=wx.ALIGN_RIGHT,
         )
         self.keyword = wx.TextCtrl(
             self,
             wx.ID_ANY,
             lcsc_selection,
             wx.DefaultPosition,
-            HighResWxSize(parent.window, wx.Size(200, 24)),
+            HighResWxSize(parent.window, wx.Size(800, 24)),
             wx.TE_PROCESS_ENTER,
         )
         self.keyword.SetHint("e.g. 10k 0603")
+
+        self.ohm_button = wx.Button(
+            self,
+            wx.ID_ANY,
+            "Ω",
+            wx.DefaultPosition,
+            HighResWxSize(parent.window, wx.Size(20, -1)),
+            0,
+        )
+        self.ohm_button.SetToolTip("Append the Ω symbol to the search string")
+
+        self.micro_button = wx.Button(
+            self,
+            wx.ID_ANY,
+            "µ",
+            wx.DefaultPosition,
+            HighResWxSize(parent.window, wx.Size(20, -1)),
+            0,
+        )
+        self.micro_button.SetToolTip("Append the µ symbol to the search string")
 
         manufacturer_label = wx.StaticText(
             self,
@@ -227,23 +252,28 @@ class PartSelectorDialog(wx.Dialog):
             0,
         )
 
-        self.search_button = wx.Button(
-            self,
-            wx.ID_ANY,
-            "Search",
-            wx.DefaultPosition,
-            HighResWxSize(parent.window, wx.Size(100, -1)),
-            0,
-        )
-
-        search_sizer_one = wx.BoxSizer(wx.VERTICAL)
-        search_sizer_one.Add(keyword_label, 0, wx.ALL, 5)
-        search_sizer_one.Add(
+        keyword_search_row1 = wx.BoxSizer(wx.HORIZONTAL)
+        keyword_search_row1.Add(keyword_label, 0, wx.ALL, 5)
+        keyword_search_row1.Add(
             self.keyword,
             0,
             wx.LEFT | wx.RIGHT | wx.BOTTOM,
             5,
         )
+        keyword_search_row1.Add(
+            self.ohm_button,
+            0,
+            wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            5,
+        )
+        keyword_search_row1.Add(
+            self.micro_button,
+            0,
+            wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            5,
+        )
+
+        search_sizer_one = wx.BoxSizer(wx.VERTICAL)
         search_sizer_one.Add(manufacturer_label, 0, wx.ALL, 5)
         search_sizer_one.Add(
             self.manufacturer,
@@ -321,13 +351,6 @@ class PartSelectorDialog(wx.Dialog):
             wx.LEFT | wx.RIGHT | wx.BOTTOM,
             5,
         )
-        search_sizer_five.AddSpacer(80)
-        search_sizer_five.Add(
-            self.search_button,
-            0,
-            wx.LEFT | wx.RIGHT | wx.BOTTOM,
-            5,
-        )
 
         help_button.SetBitmap(
             loadBitmapScaled(
@@ -337,31 +360,29 @@ class PartSelectorDialog(wx.Dialog):
         )
         help_button.SetBitmapMargins((2, 0))
 
-        self.search_button.SetBitmap(
-            loadBitmapScaled(
-                "mdi-database-search-outline.png",
-                self.parent.scale_factor,
-            )
-        )
-        self.search_button.SetBitmapMargins((2, 0))
+        search_sizer = wx.StaticBoxSizer(wx.VERTICAL, self, "Search")
 
-        search_sizer = wx.StaticBoxSizer(wx.HORIZONTAL, self, "Search")
-        search_sizer.Add(search_sizer_one, 0, wx.RIGHT, 20)
-        search_sizer.Add(search_sizer_two, 0, wx.RIGHT, 20)
-        search_sizer.Add(search_sizer_three, 0, wx.RIGHT, 20)
-        search_sizer.Add(search_sizer_four, 0, wx.RIGHT, 20)
-        search_sizer.Add(search_sizer_five, 0, wx.RIGHT, 20)
+        search_sizer.Add(keyword_search_row1)
+
+        search_sizer_row2 = wx.StaticBoxSizer(wx.HORIZONTAL, self)
+        search_sizer_row2.Add(search_sizer_one, 0, wx.RIGHT, 20)
+        search_sizer_row2.Add(search_sizer_two, 0, wx.RIGHT, 20)
+        search_sizer_row2.Add(search_sizer_three, 0, wx.RIGHT, 20)
+        search_sizer_row2.Add(search_sizer_four, 0, wx.RIGHT, 20)
+        search_sizer_row2.Add(search_sizer_five, 0, wx.RIGHT, 20)
         # search_sizer.Add(help_button, 0, wx.RIGHT, 20)
 
-        self.keyword.Bind(wx.EVT_TEXT_ENTER, self.search)
-        self.manufacturer.Bind(wx.EVT_TEXT_ENTER, self.search)
-        self.package.Bind(wx.EVT_TEXT_ENTER, self.search)
+        search_sizer.Add(search_sizer_row2)
+
+        self.keyword.Bind(wx.EVT_TEXT, self.search_dwell)
+        self.ohm_button.Bind(wx.EVT_BUTTON, self.add_ohm_symbol)
+        self.micro_button.Bind(wx.EVT_BUTTON, self.add_micro_symbol)
+        self.manufacturer.Bind(wx.EVT_TEXT, self.search_dwell)
+        self.package.Bind(wx.EVT_TEXT, self.search_dwell)
         self.category.Bind(wx.EVT_COMBOBOX, self.update_subcategories)
         self.category.Bind(wx.EVT_TEXT, self.update_subcategories)
-        self.category.Bind(wx.EVT_TEXT_ENTER, self.search)
-        self.part_no.Bind(wx.EVT_TEXT_ENTER, self.search)
-        self.solder_joints.Bind(wx.EVT_TEXT_ENTER, self.search)
-        self.search_button.Bind(wx.EVT_BUTTON, self.search)
+        self.part_no.Bind(wx.EVT_TEXT, self.search_dwell)
+        self.solder_joints.Bind(wx.EVT_TEXT, self.search_dwell)
         help_button.Bind(wx.EVT_BUTTON, self.help)
 
         # ---------------------------------------------------------------------
@@ -423,6 +444,13 @@ class PartSelectorDialog(wx.Dialog):
             flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
         ).GetRenderer().EnableEllipsize(wx.ELLIPSIZE_NONE)
         self.part_list.AppendTextColumn(
+            "Params",
+            mode=wx.dataview.DATAVIEW_CELL_INERT,
+            width=int(parent.scale_factor * 150),
+            align=wx.ALIGN_CENTER,
+            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        ).GetRenderer().EnableEllipsize(wx.ELLIPSIZE_NONE)
+        self.part_list.AppendTextColumn(
             "Stock",
             mode=wx.dataview.DATAVIEW_CELL_INERT,
             width=int(parent.scale_factor * 50),
@@ -460,6 +488,9 @@ class PartSelectorDialog(wx.Dialog):
         self.part_list.Bind(
             wx.dataview.EVT_DATAVIEW_SELECTION_CHANGED, self.OnPartSelected
         )
+
+        self.part_list.Bind(wx.EVT_LEFT_DCLICK, self.select_part)
+
 
         table_sizer = wx.BoxSizer(wx.HORIZONTAL)
         table_sizer.SetMinSize(HighResWxSize(parent.window, wx.Size(-1, 400)))
@@ -525,6 +556,9 @@ class PartSelectorDialog(wx.Dialog):
         self.Centre(wx.BOTH)
         self.enable_toolbar_buttons(False)
 
+        # initiate the initial search now that the window has been constructed
+        self.search(None)
+
     def update_settings(self, event):
         """Update the settings on change."""
         wx.PostEvent(
@@ -535,6 +569,9 @@ class PartSelectorDialog(wx.Dialog):
                 value=event.GetEventObject().GetValue(),
             ),
         )
+
+        # initiate a search now that settings have changed
+        self.search(None)
 
     @staticmethod
     def get_existing_selection(parts):
@@ -569,6 +606,22 @@ class PartSelectorDialog(wx.Dialog):
         ]:
             b.Enable(bool(state))
 
+    def add_ohm_symbol(self, *_):
+        """Append the Ω symbol to the search string."""
+        self.keyword.AppendText("Ω")
+
+    def add_micro_symbol(self, *_):
+        """Append the µ symbol to the search string."""
+        self.keyword.AppendText("µ")
+
+    def search_dwell(self, *_):
+        """Initiate a search once the timeout expires.
+
+        Used to avoid continous searches
+        when input fields are still being changed by the user.
+        """
+        self.search_timer.StartOnce(750)
+
     def search(self, *_):
         """Search the library for parts that meet the search criteria."""
         parameters = {
@@ -597,6 +650,28 @@ class PartSelectorDialog(wx.Dialog):
             )
             self.subcategory.AppendItems(subcategories)
 
+        # search now that categories might have changed
+        self.search(None)
+
+    def get_price(self, quantity, prices) -> float:
+        """Find the price for the number of selected parts accordning to the price ranges."""
+        price_ranges = prices.split(",")
+        if not price_ranges[0]:
+            return -1.0
+        min_quantity = int(price_ranges[0].split("-")[0])
+        if quantity <= min_quantity:
+            range, price = price_ranges[0].split(":")
+            return float(price)
+        for p in price_ranges:
+            range, price = p.split(":")
+            lower, upper = range.split("-")
+            if not upper:  # upper bound of price ranges
+                return float(price)
+            lower = int(lower)
+            upper = int(upper)
+            if lower <= quantity < upper:
+                return float(price)
+
     def populate_part_list(self, parts, search_duration):
         """Populate the list with the result of the search."""
         search_duration_text = (
@@ -616,20 +691,17 @@ class PartSelectorDialog(wx.Dialog):
             self.result_count.SetLabel(f"{count} Results in {search_duration_text}")
         for p in parts:
             item = [str(c) for c in p]
-            # Munge price to be more readable
-            pricecol = 8 # Must match order in library.py search function
-            price = []
-            try:
-                for t in item[pricecol].split(","):
-                    qty, p = t.split(":")
-                    p = float(p)
-                    if p < 1.0:
-                        price.append(f"{qty}: {p * 100:.2f}c")
-                    else:
-                        price.append(f"{qty}: ${p:.2f}")
-                item[pricecol] = ", ".join(price)
-            except ValueError:
-                self.logger.warning("unable to parse price %s", item[pricecol])
+            pricecol = 8  # Must match order in library.py search function
+            price = round(self.get_price(len(self.parts), item[pricecol]), 3)
+            if price > 0:
+                sum = round(price * len(self.parts), 3)
+                item[pricecol] = (
+                    f"{len(self.parts)} parts: ${price} each / ${sum} total"
+                )
+            else:
+                item[pricecol] = "Error in price data"
+            params = params_for_part({"description": item[7], "category": item[9], "package": item[2]})
+            item.insert(5, params)
             self.part_list.AppendItem(item)
 
     def select_part(self, *_):
@@ -639,11 +711,13 @@ class PartSelectorDialog(wx.Dialog):
         if row == -1:
             return
         selection = self.part_list.GetTextValue(row, 0)
-        stock = self.part_list.GetTextValue(row, 5)
+        type = self.part_list.GetTextValue(row, 4)
+        stock = self.part_list.GetTextValue(row, 6)
         wx.PostEvent(
             self.parent,
             AssignPartsEvent(
                 lcsc=selection,
+                type=type,
                 stock=stock,
                 references=self.parts.keys(),
             ),
@@ -674,7 +748,7 @@ class PartSelectorDialog(wx.Dialog):
         The others are not by default.\n
         The keyword search field is applied to "LCSC Part", "Description", "MFR.Part",
         "Package" and "Manufacturer".\n
-        Enter triggers the search the same way the search button does.\n
+        Searching occurs as input fields are changed.\n
         The results are limited to 1000.
         """
         wx.MessageBox(text, title, style=wx.ICON_INFORMATION)

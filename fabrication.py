@@ -10,8 +10,10 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from pcbnew import (  # pylint: disable=import-error
     EXCELLON_WRITER,
     PCB_PLOT_PARAMS,
+    PCB_VIA,
     PLOT_CONTROLLER,
     PLOT_FORMAT_GERBER,
+    VECTOR2I,
     ZONE_FILLER,
     B_Cu,
     B_Mask,
@@ -23,7 +25,6 @@ from pcbnew import (  # pylint: disable=import-error
     F_Mask,
     F_Paste,
     F_SilkS,
-    GetBoard,
     Refresh,
     ToMM,
 )
@@ -36,16 +37,14 @@ try:
 except ImportError:
     NO_DRILL_SHAPE = PCB_PLOT_PARAMS.NO_DRILL_SHAPE
 
-from .helpers import get_exclude_from_pos
-
 
 class Fabrication:
     """Contains all functionality to generate the JLCPCB production files."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, board):
         self.parent = parent
         self.logger = logging.getLogger(__name__)
-        self.board = GetBoard()
+        self.board = board
         self.corrections = []
         self.path, self.filename = os.path.split(self.board.GetFileName())
         self.create_folders()
@@ -103,15 +102,22 @@ class Fabrication:
 
     def get_position(self, footprint):
         """Calculate position based on center of bounding box."""
-        pads = footprint.Pads()
-        bbox = pads[0].GetBoundingBox()
-        for pad in pads:
-            bbox.Merge(pad.GetBoundingBox())
-        return bbox.GetCenter()
+        try:
+            pads = footprint.Pads()
+            bbox = pads[0].GetBoundingBox()
+            for pad in pads:
+                bbox.Merge(pad.GetBoundingBox())
+            return bbox.GetCenter()
+        except:
+            self.logger.info(
+                "WARNING footprint %s: original position used", footprint.GetReference()
+            )
+            return footprint.GetPosition()
 
     def generate_geber(self, layer_count=None):
         """Generate Gerber files."""
         # inspired by https://github.com/KiCad/kicad-source-mirror/blob/master/demos/python_scripts_examples/gen_gerber_and_drill_files_board.py
+
         pctl = PLOT_CONTROLLER(self.board)
         popt = pctl.GetPlotOptions()
 
@@ -140,14 +146,15 @@ class Fabrication:
 
         popt.SetSubtractMaskFromSilk(True)
 
-        popt.SetPlotViaOnMaskLayer(False)  # Set this to True if you need untented vias
-
         popt.SetUseAuxOrigin(True)
 
         # Tented vias or not, selcted by user in settings
-        popt.SetPlotViaOnMaskLayer(
-            not self.parent.settings.get("gerber", {}).get("tented_vias", True)
-        )
+        # Only possible via settings in KiCAD < 8.99
+        # In KiCAD 8.99 this must be set in the layer settings of KiCAD
+        if hasattr(PCB_VIA, "SetPlotViaOnMaskLayer"):
+            popt.SetPlotViaOnMaskLayer(
+                not self.parent.settings.get("gerber", {}).get("tented_vias", True)
+            )
 
         popt.SetUseGerberX2format(True)
 
@@ -242,7 +249,9 @@ class Fabrication:
                         continue
                     filePath = os.path.join(folderName, filename)
                     zipfile.write(filePath, os.path.basename(filePath))
-        self.logger.info("Finished generating ZIP file")
+        self.logger.info(
+            "Finished generating ZIP file %s", os.path.join(self.outputdir, zipname)
+        )
 
     def generate_cpl(self):
         """Generate placement file (CPL)."""
@@ -259,26 +268,35 @@ class Fabrication:
             writer.writerow(
                 ["Designator", "Val", "Package", "Mid X", "Mid Y", "Rotation", "Layer"]
             )
-            board = GetBoard()
-            for part in self.parent.store.read_pos_parts():
-                fp = board.FindFootprintByReference(part[0])
-                if get_exclude_from_pos(fp):
+            footprints = sorted(self.board.Footprints(), key=lambda x: x.GetReference())
+            for fp in footprints:
+                part = self.parent.store.get_part(fp.GetReference())
+                if not part:  # No matching part in the database, continue
                     continue
-                if not add_without_lcsc and not part[3]:
+                if part["exclude_from_pos"] == 1:
                     continue
-                position = self.get_position(fp) - aux_orgin
+                if not add_without_lcsc and not part["lcsc"]:
+                    continue
+                try:  # Kicad <= 8.0
+                    position = self.get_position(fp) - aux_orgin
+                except TypeError:  # Kicad 8.99
+                    x1, y1 = self.get_position(fp)
+                    x2, y2 = aux_orgin
+                    position = VECTOR2I(x1 - x2, y1 - y2)
                 writer.writerow(
                     [
-                        part[0],
-                        part[1],
-                        part[2],
+                        part["reference"],
+                        part["value"],
+                        part["footprint"],
                         ToMM(position.x),
                         ToMM(position.y) * -1,
                         self.fix_rotation(fp),
                         "top" if fp.GetLayer() == 0 else "bottom",
                     ]
                 )
-        self.logger.info("Finished generating CPL file")
+        self.logger.info(
+            "Finished generating CPL file %s", os.path.join(self.outputdir, cplname)
+        )
 
     def generate_bom(self):
         """Generate BOM file."""
@@ -290,9 +308,27 @@ class Fabrication:
             os.path.join(self.outputdir, bomname), "w", newline="", encoding="utf-8"
         ) as csvfile:
             writer = csv.writer(csvfile, delimiter=",")
-            writer.writerow(["Comment", "Designator", "Footprint", "LCSC"])
+            writer.writerow(["Comment", "Designator", "Footprint", "LCSC", "Quantity"])
             for part in self.parent.store.read_bom_parts():
-                if not add_without_lcsc and not part[3]:
+                components = part["refs"].split(",")
+                for component in components:
+                    for fp in self.board.Footprints():
+                        if fp.GetReference() == component and hasattr(fp, "IsDNP") and callable(fp.IsDNP) and fp.IsDNP():
+                            components.remove(component)
+                            part["refs"] = ",".join(components)
+                            self.logger.info(
+                                "Component %s has 'Do not place' enabled: removing from BOM",
+                                component,
+                            )
+                if not add_without_lcsc and not part["lcsc"]:
+                    self.logger.info(
+                        "Component %s has no LCSC number assigned and the setting Add parts without LCSC is disabled: removing from BOM",
+                        component,
+                    )
                     continue
-                writer.writerow(part)
-        self.logger.info("Finished generating BOM file")
+                writer.writerow(
+                    [part["value"], part["refs"], part["footprint"], part["lcsc"], len(components)]
+                )
+        self.logger.info(
+            "Finished generating BOM file %s", os.path.join(self.outputdir, bomname)
+        )

@@ -2,11 +2,9 @@
 
 import contextlib
 from enum import Enum
-from glob import glob
 import logging
 import os
 from pathlib import Path
-import shlex
 import sqlite3
 from threading import Thread
 import time
@@ -20,7 +18,7 @@ from .events import (
     ResetGaugeEvent,
     UpdateGaugeEvent,
 )
-from .helpers import PLUGIN_PATH, natural_sort_collation
+from .helpers import PLUGIN_PATH, dict_factory, natural_sort_collation
 from .unzip_parts import unzip_parts
 
 
@@ -35,16 +33,13 @@ class LibraryState(Enum):
 class Library:
     """A storage class to get data from a sqlite database and write it back."""
 
-    # no longer works
-    CSV_URL = "https://jlcpcb.com/componentSearch/uploadComponentInfo"
-
     def __init__(self, parent):
         self.logger = logging.getLogger(__name__)
         self.parent = parent
         self.order_by = "LCSC Part"
         self.order_dir = "ASC"
         self.datadir = os.path.join(PLUGIN_PATH, "jlcpcb")
-        self.partsdb_file = os.path.join(self.datadir, "parts.db")
+        self.partsdb_file = os.path.join(self.datadir, "parts-fts5.db")
         self.rotationsdb_file = os.path.join(self.datadir, "rotations.db")
         self.mappingsdb_file = os.path.join(self.datadir, "mappings.db")
         self.state = None
@@ -90,10 +85,10 @@ class Library:
             "Package",
             "Solder Joint",
             "Library Type",
+            "Stock",
             "Manufacturer",
             "Description",
             "Price",
-            "Stock",
         ]
         if self.order_by == order_by[n] and self.order_dir == "ASC":
             self.order_dir = "DESC"
@@ -103,6 +98,15 @@ class Library:
 
     def search(self, parameters):
         """Search the database for parts that meet the given parameters."""
+
+        # skip searching if there are no keywords and the part number
+        # field is empty as there are too many parts for the search
+        # to reasonbly show the desired part
+        if parameters["keyword"] == "" and (
+            "part_no" not in parameters or parameters["part_no"] == ""
+        ):
+            return []
+
         # Note: this must mach the widget order in PartSelectorDialog init and
         # populate_part_list in parselector.py
         columns = [
@@ -115,45 +119,65 @@ class Library:
             "Manufacturer",
             "Description",
             "Price",
+            "First Category",
         ]
         s = ",".join(f'"{c}"' for c in columns)
         query = f"SELECT {s} FROM parts WHERE "
 
-        try:
-            keywords = shlex.split(parameters["keyword"])
-        except ValueError as e:
-            self.logger.error("Can't split keyword: %s", str(e))
+        match_chunks = []
+        like_chunks = []
 
-        keyword_columns = [
-            "LCSC Part",
-            "Description",
-            "MFR.Part",
-            "Package",
-            "Manufacturer",
-        ]
         query_chunks = []
-        for kw in keywords:
-            q = " OR ".join(f'"{c}" LIKE "%{kw}%"' for c in keyword_columns)
-            query_chunks.append(f"({q})")
+
+        # Build 'match_chunks' and 'like_chunks' arrays
+        #
+        # FTS5 (https://www.sqlite.org/fts5.html) has a substring limit of
+        # at least 3 characters.
+        # 'Substrings consisting of fewer than 3 unicode characters do not
+        #  match any rows when used with a full-text query'
+        #
+        # However, they will still match with a LIKE.
+        #
+        # So extract out the <3 character strings and add a 'LIKE' term
+        # for each of those.
+        if parameters["keyword"] != "":
+            keywords = parameters["keyword"].split(" ")
+            match_keywords_intermediate = []
+            for w in keywords:
+                # skip over empty keywords
+                if w != "":
+                    if len(w) < 3:  # LIKE entry
+                        kw = f"description LIKE '%{w}%'"
+                        like_chunks.append(kw)
+                    else:  # MATCH entry
+                        kw = f'"{w}"'
+                        match_keywords_intermediate.append(kw)
+            if match_keywords_intermediate:
+                match_entry = " AND ".join(match_keywords_intermediate)
+                match_chunks.append(f"{match_entry}")
 
         if "manufacturer" in parameters and parameters["manufacturer"] != "":
             p = parameters["manufacturer"]
-            query_chunks.append(f'"Manufacturer" LIKE "{p}"')
+            match_chunks.append(f'"Manufacturer":"{p}"')
         if "package" in parameters and parameters["package"] != "":
             p = parameters["package"]
-            query_chunks.append(f'"Package" LIKE "{p}"')
-        if "category" in parameters and parameters["category"] != "" and parameters["category"] != "All":
+            match_chunks.append(f'"Package":"{p}"')
+        if (
+            "category" in parameters
+            and parameters["category"] != ""
+            and parameters["category"] != "All"
+        ):
             p = parameters["category"]
-            query_chunks.append(f'"First Category" LIKE "{p}"')
+            match_chunks.append(f'"First Category":"{p}"')
         if "subcategory" in parameters and parameters["subcategory"] != "":
             p = parameters["subcategory"]
-            query_chunks.append(f'"Second Category" LIKE "{p}"')
+            match_chunks.append(f'"Second Category":"{p}"')
         if "part_no" in parameters and parameters["part_no"] != "":
             p = parameters["part_no"]
-            query_chunks.append(f'"MFR.Part" LIKE "{p}"')
+            match_chunks.append(f'"MFR.Part":"{p}"')
         if "solder_joints" in parameters and parameters["solder_joints"] != "":
             p = parameters["solder_joints"]
-            query_chunks.append(f'"Solder Joint" LIKE "{p}"')
+            match_chunks.append(f'"Solder Joint":"{p}"')
 
         library_types = []
         if parameters["basic"]:
@@ -166,10 +190,24 @@ class Library:
         if parameters["stock"]:
             query_chunks.append('"Stock" > "0"')
 
-        if not query_chunks:
+        if not match_chunks and not like_chunks and not query_chunks:
             return []
 
-        query += " AND ".join(query_chunks)
+        if match_chunks:
+            query += "parts MATCH '"
+            query += " AND ".join(match_chunks)
+            query += "'"
+
+        if like_chunks:
+            if match_chunks:
+                query += " AND "
+            query += " AND ".join(like_chunks)
+
+        if query_chunks:
+            if match_chunks or like_chunks:
+                query += " AND "
+            query += " AND ".join(query_chunks)
+
         query += f' ORDER BY "{self.order_by}" COLLATE naturalsort {self.order_dir}'
         query += " LIMIT 1000"
 
@@ -314,17 +352,6 @@ class Library:
                 ).fetchall()
             ]
 
-    def update_meta_data(self, filename, size, partcount, date, last_update):
-        """Update the meta data table."""
-        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
-            cur.execute("DELETE from meta")
-            cur.commit()
-            cur.execute(
-                "INSERT INTO meta VALUES (?, ?, ?, ?, ?)",
-                (filename, size, partcount, date, last_update),
-            )
-            cur.commit()
-
     def create_parts_table(self, columns):
         """Create the parts table."""
         with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
@@ -332,28 +359,17 @@ class Library:
             cur.execute(f"CREATE TABLE IF NOT EXISTS parts ({cols})")
             cur.commit()
 
-    def insert_parts(self, data, cols):
-        """Insert many parts at once."""
+    def get_part_details(self, number: str) -> dict:
+        """Get the part details for a LCSC number using optimized FTS5 querying."""
         with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con:
-            cols = ",".join(["?"] * cols)
-            query = f"INSERT INTO parts VALUES ({cols})"
-            con.executemany(query, data)
-            con.commit()
-
-    def get_part_details(self, lcsc):
-        """Get the part details for a list of lcsc numbers."""
-        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
-            numbers = ",".join([f'"{n}"' for n in lcsc])
-
-            try:
-                return cur.execute(
-                    f'SELECT "LCSC Part", "Stock", "Library Type" FROM parts where "LCSC Part" IN ({numbers})'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                # parts tabble doesn't exist. can indicate our database is corrupt or we weren't able
-                # to populate from the URL.
-                # act like we returned nothing then.
-                return []
+            con.row_factory = dict_factory  # noqa: DC05
+            cur = con.cursor()
+            query = """SELECT "LCSC Part" AS lcsc, "Stock" AS stock, "Library Type" AS type,
+                "MFR.Part" as part_no, "Description" as description, "Package" as package,
+                "First Category" as category
+                FROM parts WHERE parts MATCH :number"""
+            cur.execute(query, {"number": number})
+            return next((n for n in cur.fetchall() if n["lcsc"] == number), {})
 
     def update(self):
         """Update the sqlite parts database from the JLCPCB CSV."""
@@ -364,16 +380,26 @@ class Library:
         self.state = LibraryState.DOWNLOAD_RUNNING
         start = time.time()
         wx.PostEvent(self.parent, ResetGaugeEvent())
-        # Download the zipped parts database
+
+        # Define basic variables
         url_stub = "https://bouni.github.io/kicad-jlcpcb-tools/"
-        cnt_file = "chunk_num.txt"
-        cnt = 0
-        chunk_file_stub = "parts.db.zip."
+        cnt_file = "chunk_num_fts5.txt"
+        progress_file = os.path.join(self.datadir, "progress.txt")
+        chunk_file_stub = "parts-fts5.db.zip."
+        completed_chunks = set()
+
+        # Check if there is a progress file
+        if os.path.exists(progress_file):
+            with open(progress_file) as f:
+                # Read completed chunk indices from the progress file
+                completed_chunks = {int(line.strip()) for line in f.readlines()}
+
+        # Get the total number of chunks to download
         try:
             r = requests.get(
                 url_stub + cnt_file, allow_redirects=True, stream=True, timeout=300
             )
-            if r.status_code != requests.codes.ok:  # pylint: disable=no-member
+            if r.status_code != requests.codes.ok:
                 wx.PostEvent(
                     self.parent,
                     MessageEvent(
@@ -385,87 +411,121 @@ class Library:
                     ),
                 )
                 self.state = LibraryState.INITIALIZED
-                self.create_tables(["placeholder_invalid_column_fix_errors"])
                 return
 
-            self.logger.debug(
-                "Parts db is split into %s parts. Proceeding to download...", r.text
-            )
-            cnt = int(r.text)
-            self.logger.debug("Removing any spurios old zip part files...")
-            for p in glob(str(Path(self.datadir) / (chunk_file_stub + "*"))):
-                self.logger.debug("Removing %s.", p)
-                os.unlink(p)
-        except Exception as e:  # pylint: disable=broad-exception-caught
+            total_chunks = int(r.text)
+        except Exception as e:
             wx.PostEvent(
                 self.parent,
                 MessageEvent(
                     title="Download Error",
-                    text=f"Failed to download the JLCPCB database, {e}",
+                    text=f"Failed to fetch database chunk count, {e}",
                     style="error",
                 ),
             )
             self.state = LibraryState.INITIALIZED
-            self.create_tables(["placeholder_invalid_column_fix_errors"])
             return
 
-        for i in range(cnt):
-            chunk_file = chunk_file_stub + f"{i+1:03}"
-            with open(os.path.join(self.datadir, chunk_file), "wb") as f:
-                try:
+        # Re-download incomplete or missing chunks
+        for i in range(total_chunks):
+            chunk_index = i + 1
+            chunk_file = chunk_file_stub + f"{chunk_index:03}"
+            chunk_path = os.path.join(self.datadir, chunk_file)
+
+            # Check if the chunk is logged as completed but the file might be incomplete
+            if chunk_index in completed_chunks:
+                if os.path.exists(chunk_path):
+                    # Validate the size of the chunk file
+                    try:
+                        expected_size = int(
+                            requests.head(
+                                url_stub + chunk_file, timeout=300
+                            ).headers.get("Content-Length", 0)
+                        )
+                        actual_size = os.path.getsize(chunk_path)
+                        if actual_size == expected_size:
+                            self.logger.debug(
+                                "Skipping already downloaded and validated chunk %d.",
+                                chunk_index,
+                            )
+                            continue
+                        else:
+                            self.logger.warning(
+                                "Chunk %d is incomplete, re-downloading.", chunk_index
+                            )
+                    except Exception as e:
+                        self.logger.warning(
+                            "Unable to validate chunk %d, re-downloading. Error: %s",
+                            chunk_index,
+                            e,
+                        )
+                else:
+                    self.logger.warning(
+                        "Chunk %d marked as completed but file is missing, re-downloading.",
+                        chunk_index,
+                    )
+
+            # Download the chunk
+            try:
+                with open(chunk_path, "wb") as f:
                     r = requests.get(
                         url_stub + chunk_file,
                         allow_redirects=True,
                         stream=True,
                         timeout=300,
                     )
-                    if r.status_code != requests.codes.ok:  # pylint: disable=no-member
+                    if r.status_code != requests.codes.ok:
                         wx.PostEvent(
                             self.parent,
                             MessageEvent(
                                 title="Download Error",
-                                text=f"Failed to download the JLCPCB database, error code {r.status_code}\n"
+                                text=f"Failed to download chunk {chunk_index}, error code {r.status_code}\n"
                                 + "URL was:\n"
                                 f"'{url_stub + chunk_file}'",
                                 style="error",
                             ),
                         )
                         self.state = LibraryState.INITIALIZED
-                        self.create_tables(["placeholder_invalid_column_fix_errors"])
                         return
 
-                    size = int(r.headers.get("Content-Length"))
+                    size = int(r.headers.get("Content-Length", 0))
                     self.logger.debug(
-                        "Download parts db chunk %d with a size of %.2fMB",
-                        i + 1,
+                        "Downloading chunk %d/%d (%.2f MB)",
+                        chunk_index,
+                        total_chunks,
                         size / 1024 / 1024,
                     )
                     for data in r.iter_content(chunk_size=4096):
                         f.write(data)
                         progress = f.tell() / size * 100
                         wx.PostEvent(self.parent, UpdateGaugeEvent(value=progress))
-                except Exception as e:  # pylint: disable= broad-exception-caught
-                    wx.PostEvent(
-                        self.parent,
-                        MessageEvent(
-                            title="Download Error",
-                            text=f"Failed to download the JLCPCB database, {e}",
-                            style="error",
-                        ),
-                    )
-                    self.state = LibraryState.INITIALIZED
-                    self.create_tables(["placeholder_invalid_column_fix_errors"])
-                    return
-        # rename existing parts.db to parts.db.bak, delete already existing bak file if neccesary
-        if os.path.exists(self.partsdb_file):
-            if os.path.exists(f"{self.partsdb_file}.bak"):
-                os.remove(f"{self.partsdb_file}.bak")
-            os.rename(self.partsdb_file, f"{self.partsdb_file}.bak")
-        # unzip downloaded parts.zip
+                    self.logger.debug("Chunk %d downloaded successfully.", chunk_index)
+
+                # Update progress file after successful download
+                with open(progress_file, "a") as f:
+                    f.write(f"{chunk_index}\n")
+
+            except Exception as e:
+                wx.PostEvent(
+                    self.parent,
+                    MessageEvent(
+                        title="Download Error",
+                        text=f"Failed to download chunk {chunk_index}, {e}",
+                        style="error",
+                    ),
+                )
+                self.state = LibraryState.INITIALIZED
+                return
+
+        # Delete progress file to indicate the download is complete
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+
+        # Combine and extract downloaded files
         self.logger.debug("Combining and extracting zip part files...")
         try:
-            unzip_parts(self.datadir)
-        except Exception as e:  # pylint: disable=broad-exception-caught
+            unzip_parts(self.parent, self.datadir)
+        except Exception as e:
             wx.PostEvent(
                 self.parent,
                 MessageEvent(
@@ -475,36 +535,33 @@ class Library:
                 ),
             )
             self.state = LibraryState.INITIALIZED
-            self.create_tables(["placeholder_invalid_column_fix_errors"])
             return
-        # check if partsdb_file was successfully extracted
+
+        # Check if the database file was successfully extracted
         if not os.path.exists(self.partsdb_file):
-            if os.path.exists(f"{self.partsdb_file}.bak"):
-                os.rename(f"{self.partsdb_file}.bak", self.partsdb_file)
-                wx.PostEvent(
-                    self.parent,
-                    MessageEvent(
-                        title="Download Error",
-                        text="Failed to download the JLCPCB database, db was not extracted from zip",
-                        style="error",
-                    ),
-                )
-                self.state = LibraryState.INITIALIZED
-                self.create_tables(["placeholder_invalid_column_fix_errors"])
-                return
-        else:
-            wx.PostEvent(self.parent, ResetGaugeEvent())
-            end = time.time()
-            wx.PostEvent(self.parent, PopulateFootprintListEvent())
             wx.PostEvent(
                 self.parent,
                 MessageEvent(
-                    title="Success",
-                    text=f"Successfully downloaded and imported the JLCPCB database in {end-start:.2f} seconds!",
-                    style="info",
+                    title="Download Error",
+                    text="Failed to extract the database file from the downloaded zip.",
+                    style="error",
                 ),
             )
             self.state = LibraryState.INITIALIZED
+            return
+
+        wx.PostEvent(self.parent, ResetGaugeEvent())
+        end = time.time()
+        wx.PostEvent(self.parent, PopulateFootprintListEvent())
+        wx.PostEvent(
+            self.parent,
+            MessageEvent(
+                title="Success",
+                text=f"Successfully downloaded and imported the JLCPCB database in {end - start:.2f} seconds!",
+                style="info",
+            ),
+        )
+        self.state = LibraryState.INITIALIZED
 
     def create_tables(self, headers):
         """Create all tables."""
@@ -523,12 +580,14 @@ class Library:
         information from the on-disk database.
         """
         if not self.category_map:
+            self.category_map.setdefault("", "")
+
             # Populate the cache.
             with contextlib.closing(
                 sqlite3.connect(self.partsdb_file)
             ) as con, con as cur:
                 for row in cur.execute(
-                    'SELECT DISTINCT "First Category", "Second Category" FROM parts ORDER BY UPPER("First Category"), UPPER("Second Category")'
+                    'SELECT * from categories ORDER BY UPPER("First Category"), UPPER("Second Category")'
                 ):
                     self.category_map.setdefault(row[0], []).append(row[1])
         tmp = list(self.category_map.keys())
@@ -594,3 +653,14 @@ class Library:
                 self.logger.debug("Droped mappings table from parts database.")
             except sqlite3.OperationalError:
                 return
+
+    def get_last_update(self) -> str:
+        """Get last update from meta table."""
+        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
+            try:
+                last_update = cur.execute("SELECT last_update FROM meta").fetchone()
+                if last_update:
+                    return last_update[0]
+                return ""
+            except sqlite3.OperationalError:
+                return ""
